@@ -3,6 +3,7 @@ Django settings for rentalroomshare project.
 """
 import pymysql
 pymysql.install_as_MySQLdb()
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -161,3 +162,5 @@ EMAIL_HOST_USER = 'talapanenidivya6@gmail.com'
 EMAIL_HOST_PASSWORD = 'louhxcuhjqsnnhfq'  # Gmail App Password
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')

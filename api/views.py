@@ -35,6 +35,9 @@ from .models import (
     AppNotification,
     ListedRoom,
     ListedRoomPhoto,
+    RoomShareRequest,
+    Notification,
+    BookingHistory,
 )
 
 from .serializers import (
@@ -54,6 +57,14 @@ from .serializers import (
     UserAccountSettingsSerializer,
     ListedRoomSerializer,
     AppNotificationSerializer,
+    HomeRoomListSerializer,
+    HomeRoomDetailSerializer,
+    RoomShareRequestSerializer,
+    RoomShareVerificationSerializer,
+    RoomShareFinalReviewSerializer,
+    RoomShareRequestSentSerializer,
+    NotificationSerializer,
+    BookingHistorySerializer,
 )
 
 User = get_user_model()
@@ -103,25 +114,15 @@ def _display_name(user):
     profile = _get_user_profile(user)
     if profile and profile.full_name:
         return profile.full_name
-
-    full_name = " ".join(
-        filter(
-            None,
-            [
-                getattr(user, "first_name", ""),
-                getattr(user, "middle_name", ""),
-                getattr(user, "last_name", ""),
-            ],
-        )
-    ).strip()
-
-    return full_name if full_name else user.email
+    return user.email
 
 
 def _member_photo_url(user, request):
     profile = _get_user_profile(user)
-    if profile and profile.photo:
-        return request.build_absolute_uri(profile.photo.url)
+    if profile and getattr(profile, "profile_photo", None):
+        return request.build_absolute_uri(profile.profile_photo.url) if request else profile.profile_photo.url
+    if profile and getattr(profile, "photo", None):
+        return request.build_absolute_uri(profile.photo.url) if request else profile.photo.url
     return None
 
 
@@ -179,9 +180,10 @@ def calculate_match_score(current_user, other_user):
             reasons.append("Same social interaction style")
 
     if current_budget and other_budget:
-        if current_budget.preferred_city.strip().lower() == other_budget.preferred_city.strip().lower():
-            score += 20
-            reasons.append("Preferred city matches")
+        if current_budget.preferred_city and other_budget.preferred_city:
+            if current_budget.preferred_city.strip().lower() == other_budget.preferred_city.strip().lower():
+                score += 20
+                reasons.append("Preferred city matches")
 
         budget_gap = abs(float(current_budget.monthly_budget) - float(other_budget.monthly_budget))
         if budget_gap <= 2000:
@@ -307,16 +309,61 @@ def _build_target_location(member_users):
     }
 
 
-def _build_group_name(location_name, member_count):
-    if member_count == 1:
-        suffix = "Solo"
-    elif member_count == 2:
-        suffix = "Duo"
-    else:
-        suffix = "Trio"
+def _build_group_name(member_users):
+    creative_names = [
+        "Harmony Nest",
+        "Urban Haven",
+        "Cozy Collective",
+        "Dream Dwellers",
+        "Shared Serenity",
+        "The Chill Circle",
+        "Home Harmony",
+        "Nest & Nook",
+        "Tranquil Tribe",
+        "Roomie Rhythm",
+        "Better Together",
+        "Happy Habitat",
+        "Golden Corner",
+        "Peace Pad",
+        "Comfort Cove",
+        "Warm Vibes",
+        "Calm Corner",
+        "Living Bloom",
+        "House of Harmony",
+        "Safe Stay Circle",
+        "Purely Shared",
+        "The Haven House",
+        "Quiet Quarters",
+        "Perfect Pairing",
+        "Blue Door Living",
+        "Moonlight Manor",
+        "Sunrise Shared",
+        "CoLiving Bliss",
+        "DreamSpace",
+        "The Velvet Nest",
+    ]
 
-    base_name = location_name if location_name and location_name != "Location not available" else "Harmony"
-    return f"The {base_name} {suffix}"
+    # Stable per group, so the same member combination gets the same name
+    seed_source = "|".join(sorted([user.email.lower() for user in member_users]))
+    stable_index = sum(ord(ch) for ch in seed_source) % len(creative_names)
+    base_name = creative_names[stable_index]
+
+    used_names = set(GroupChat.objects.values_list("group_name", flat=True))
+
+    if base_name not in used_names:
+        return base_name
+
+    suffixes = [
+        "One", "Prime", "Plus", "Nova", "Echo",
+        "Aura", "Rise", "Bloom", "Spark", "Vista",
+    ]
+
+    for suffix in suffixes:
+        candidate = f"{base_name} {suffix}"
+        if candidate not in used_names:
+            return candidate
+
+    return f"{base_name} {random.randint(100, 999)}"
 
 
 def _build_group_members(member_users, request):
@@ -327,20 +374,20 @@ def _build_group_members(member_users, request):
         lifestyle = _get_user_lifestyle(user)
         budget = _get_user_budget(user)
 
-        full_name = None
-        if profile and profile.full_name:
-            full_name = profile.full_name
-        else:
-            full_name = _display_name(user)
+        photo_url = None
+        if profile and profile.photo:
+            photo_url = request.build_absolute_uri(profile.photo.url) if request else profile.photo.url
+        elif profile and profile.profile_photo:
+            photo_url = request.build_absolute_uri(profile.profile_photo.url) if request else profile.profile_photo.url
 
         members.append(
             {
                 "email": user.email,
-                "full_name": full_name,
-                "age": profile.age if profile and profile.age is not None else getattr(user, "age", None),
-                "city": budget.preferred_city if budget else getattr(user, "address", None),
+                "full_name": profile.full_name if profile else user.email,
+                "age": profile.age if profile else None,
+                "city": budget.preferred_city if budget else None,
                 "monthly_budget": _format_budget(budget.monthly_budget) if budget else None,
-                "photo": request.build_absolute_uri(profile.photo.url) if profile and profile.photo else None,
+                "photo": photo_url,
                 "tags": _member_tags(lifestyle),
             }
         )
@@ -418,11 +465,7 @@ def _build_group_chat_payload(chat, request):
 
 
 def _build_direct_chat_payload(chat, current_user, request):
-    if chat.user1 == current_user:
-        other_user = chat.user2
-    else:
-        other_user = chat.user1
-
+    other_user = chat.user2 if chat.user1 == current_user else chat.user1
     other_profile = _get_user_profile(other_user)
     messages = DirectChatMessage.objects.filter(chat=chat).order_by("created_at")
 
@@ -439,13 +482,19 @@ def _build_direct_chat_payload(chat, current_user, request):
             "created_at": msg.created_at,
         })
 
+    other_photo = None
+    if other_profile and getattr(other_profile, "profile_photo", None):
+        other_photo = request.build_absolute_uri(other_profile.profile_photo.url) if request else other_profile.profile_photo.url
+    elif other_profile and getattr(other_profile, "photo", None):
+        other_photo = request.build_absolute_uri(other_profile.photo.url) if request else other_profile.photo.url
+
     return {
         "chat_id": chat.id,
         "chat_type": "direct",
         "user": {
             "email": other_user.email,
-            "full_name": other_profile.full_name if other_profile and other_profile.full_name else _display_name(other_user),
-            "photo": request.build_absolute_uri(other_profile.photo.url) if other_profile and other_profile.photo else None,
+            "full_name": other_profile.full_name if other_profile and other_profile.full_name else other_user.email,
+            "photo": other_photo,
         },
         "emoji_options": [
             "😊", "😂", "🥰", "😍", "🤩", "😎",
@@ -506,6 +555,13 @@ def _seed_group_chat_messages(chat, member_users, current_user, location_name):
     )
 
 
+def _calculate_room_share_amounts(room):
+    monthly_rent = Decimal(room.monthly_rent)
+    deposit = Decimal(room.monthly_rent)
+    total = monthly_rent + deposit
+    return monthly_rent, deposit, total
+
+
 class SendOTPView(APIView):
     permission_classes = [AllowAny]
 
@@ -519,15 +575,7 @@ class SendOTPView(APIView):
 
         user, _ = User.objects.get_or_create(
             email=email,
-            defaults={
-                "is_active": False,
-                "first_name": "Unknown",
-                "middle_name": "",
-                "last_name": "Unknown",
-                "age": None,
-                "address": "",
-                "phone_number": "",
-            }
+            defaults={"is_active": False}
         )
 
         OTP.objects.filter(user=user).delete()
@@ -580,87 +628,37 @@ class RegisterView(generics.CreateAPIView):
     permission_classes = [AllowAny]
 
     def create(self, request, *args, **kwargs):
-        email = request.data.get("email")
-        password = request.data.get("password")
-        first_name = request.data.get("first_name")
-        middle_name = request.data.get("middle_name", "")
-        last_name = request.data.get("last_name")
-        age = request.data.get("age")
-        address = request.data.get("address", "")
-        phone_number = request.data.get("phone_number", "")
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
 
-        if not email:
-            return Response({"error": "Email is required"}, status=status.HTTP_400_BAD_REQUEST)
+        email = serializer.validated_data["email"].lower().strip()
 
-        if not password:
-            return Response({"error": "Password is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if User.objects.filter(email=email).exists():
+            return Response(
+                {"error": "User already registered with this email."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        if not first_name:
-            return Response({"error": "First name is required"}, status=status.HTTP_400_BAD_REQUEST)
+        user = serializer.save()
+        user.is_active = True
+        user.save()
 
-        if not last_name:
-            return Response({"error": "Last name is required"}, status=status.HTTP_400_BAD_REQUEST)
+        profile = UserProfile.objects.filter(user=user).first()
 
-        try:
-            user = User.objects.get(email=email)
-
-            if not user.is_active:
-                return Response(
-                    {"error": "Verify OTP first before registering."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            if user.has_usable_password():
-                return Response(
-                    {"error": "User already registered with this email."},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            user.first_name = first_name
-            user.middle_name = middle_name
-            user.last_name = last_name
-            user.age = age if age not in [None, ""] else None
-            user.address = address
-            user.phone_number = phone_number
-            user.set_password(password)
-            user.save()
-
-            return Response({
-                "success": True,
-                "message": "Registration successful.",
-                "user": {
-                    "id": user.id,
-                    "first_name": user.first_name,
-                    "middle_name": user.middle_name,
-                    "last_name": user.last_name,
-                    "age": user.age,
-                    "address": user.address,
-                    "email": user.email,
-                    "phone_number": user.phone_number,
-                }
-            }, status=status.HTTP_201_CREATED)
-
-        except User.DoesNotExist:
-            serializer = self.get_serializer(data=request.data)
-            serializer.is_valid(raise_exception=True)
-            user = serializer.save()
-            user.is_active = True
-            user.save()
-
-            return Response({
-                "success": True,
-                "message": "Registration successful.",
-                "user": {
-                    "id": user.id,
-                    "first_name": user.first_name,
-                    "middle_name": user.middle_name,
-                    "last_name": user.last_name,
-                    "age": user.age,
-                    "address": user.address,
-                    "email": user.email,
-                    "phone_number": user.phone_number,
-                }
-            }, status=status.HTTP_201_CREATED)
+        return Response({
+            "success": True,
+            "message": "Registration successful.",
+            "next_screen": "lifestyle",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "full_name": profile.full_name if profile else None,
+                "gender": profile.gender if profile else None,
+                "age": profile.age if profile else None,
+                "occupation": profile.occupation if profile else None,
+                "address": profile.address if profile else None,
+            }
+        }, status=status.HTTP_201_CREATED)
 
 
 class LoginView(APIView):
@@ -677,13 +675,7 @@ class LoginView(APIView):
             "message": "Login successful",
             "user": {
                 "id": user.id,
-                "email": user.email,
-                "first_name": getattr(user, "first_name", ""),
-                "middle_name": getattr(user, "middle_name", ""),
-                "last_name": getattr(user, "last_name", ""),
-                "age": getattr(user, "age", None),
-                "address": getattr(user, "address", ""),
-                "phone_number": getattr(user, "phone_number", ""),
+                "email": user.email
             }
         }, status=status.HTTP_200_OK)
 
@@ -853,11 +845,16 @@ class UserProfileCreateUpdateView(APIView):
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        profile_obj, created = UserProfile.objects.get_or_create(user=user)
+        profile_obj, created = UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"full_name": user.email}
+        )
 
         data = {
             "full_name": request.data.get("full_name"),
+            "gender": request.data.get("gender"),
             "age": request.data.get("age"),
+            "address": request.data.get("address"),
             "room_status": request.data.get("room_status"),
             "about_me": request.data.get("about_me"),
             "occupation": request.data.get("occupation"),
@@ -869,9 +866,12 @@ class UserProfileCreateUpdateView(APIView):
         if "photo" in request.FILES:
             data["photo"] = request.FILES["photo"]
 
+        if "profile_photo" in request.FILES:
+            data["profile_photo"] = request.FILES["profile_photo"]
+
         serializer = UserProfileCreateUpdateSerializer(profile_obj, data=data, partial=True)
         if serializer.is_valid():
-            serializer.save()
+            profile_obj = serializer.save()
             create_notification(
                 user,
                 "Profile Updated",
@@ -934,18 +934,24 @@ class MatchDetailView(APIView):
         lifestyle = UserLifestyle.objects.filter(user=user).first()
         budget = UserBudgetLocation.objects.filter(user=user).first()
 
+        photo_url = None
+        if profile and profile.photo:
+            photo_url = request.build_absolute_uri(profile.photo.url) if request else profile.photo.url
+        elif profile and profile.profile_photo:
+            photo_url = request.build_absolute_uri(profile.profile_photo.url) if request else profile.profile_photo.url
+
         data = {
             "match_id": match.id,
             "email": user.email,
-            "full_name": profile.full_name if profile and profile.full_name else _display_name(user),
-            "age": profile.age if profile and profile.age is not None else getattr(user, "age", None),
+            "full_name": profile.full_name if profile else None,
+            "age": profile.age if profile else None,
             "room_status": profile.room_status if profile else None,
-            "photo": request.build_absolute_uri(profile.photo.url) if profile and profile.photo else None,
+            "photo": photo_url,
             "sleep_schedule": lifestyle.sleep_schedule if lifestyle else None,
             "cleanliness": lifestyle.cleanliness if lifestyle else None,
             "social_interaction": lifestyle.social_interaction if lifestyle else None,
             "monthly_budget": str(budget.monthly_budget) if budget else None,
-            "preferred_city": budget.preferred_city if budget else getattr(user, "address", None),
+            "preferred_city": budget.preferred_city if budget else None,
             "compatibility_score": match.compatibility_score,
             "ai_explanation": match.ai_explanation
         }
@@ -995,12 +1001,18 @@ class FavoriteListView(APIView):
         for fav in favorites:
             profile = UserProfile.objects.filter(user=fav.matched_user).first()
 
+            photo_url = None
+            if profile and profile.photo:
+                photo_url = request.build_absolute_uri(profile.photo.url) if request else profile.photo.url
+            elif profile and profile.profile_photo:
+                photo_url = request.build_absolute_uri(profile.profile_photo.url) if request else profile.profile_photo.url
+
             data.append({
                 "email": fav.matched_user.email,
-                "name": profile.full_name if profile and profile.full_name else _display_name(fav.matched_user),
-                "age": profile.age if profile and profile.age is not None else getattr(fav.matched_user, "age", None),
+                "name": profile.full_name if profile else None,
+                "age": profile.age if profile else None,
                 "room_status": profile.room_status if profile else None,
-                "photo": request.build_absolute_uri(profile.photo.url) if profile and profile.photo else None
+                "photo": photo_url
             })
 
         return Response({
@@ -1026,7 +1038,7 @@ class ViewGroupDetailView(APIView):
         harmony_score = round(sum(score_values) / len(score_values)) if score_values else 100
 
         target_location = _build_target_location(member_users)
-        group_name = _build_group_name(target_location["name"], len(member_users))
+        group_name = _build_group_name(member_users)
         ai_insight = _build_group_insight(member_users)
 
         data = {
@@ -1057,7 +1069,7 @@ class StartGroupChatView(APIView):
         member_users = [current_user] + [match.matched_user for match in top_matches]
 
         target_location = _build_target_location(member_users)
-        group_name = _build_group_name(target_location["name"], len(member_users))
+        group_name = _build_group_name(member_users)
         ai_insight = _build_group_insight(member_users)
 
         chat = GroupChat.objects.filter(created_for=current_user, group_name=group_name).first()
@@ -1077,14 +1089,19 @@ class StartGroupChatView(APIView):
             for user in member_users:
                 profile = _get_user_profile(user)
                 budget = _get_user_budget(user)
+                member_photo = None
+                if profile and getattr(profile, "profile_photo", None):
+                    member_photo = profile.profile_photo
+                elif profile and getattr(profile, "photo", None):
+                    member_photo = profile.photo
 
                 GroupChatMember.objects.create(
                     chat=chat,
                     user=user,
-                    full_name=profile.full_name if profile and profile.full_name else _display_name(user),
-                    age=profile.age if profile and profile.age is not None else getattr(user, "age", None),
-                    city=budget.preferred_city if budget else getattr(user, "address", None),
-                    photo=profile.photo if profile and profile.photo else None,
+                    full_name=profile.full_name if profile and profile.full_name else user.email,
+                    age=profile.age if profile else None,
+                    city=budget.preferred_city if budget else None,
+                    photo=member_photo,
                 )
 
             _seed_group_chat_messages(chat, member_users, current_user, target_location["name"])
@@ -1230,40 +1247,66 @@ class GroupChatUploadImageView(APIView):
         sender_email = request.data.get("sender_email")
         image_source = request.data.get("image_source")
         caption = request.data.get("caption", "")
-        image = request.FILES.get("image")
 
-        if not chat_id or not sender_email or not image:
-            return Response({"error": "chat_id, sender_email and image are required"}, status=status.HTTP_400_BAD_REQUEST)
+        images = request.FILES.getlist("image")
+
+        if not chat_id or not sender_email:
+            return Response(
+                {"error": "chat_id and sender_email are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not images:
+            return Response(
+                {"error": "At least one image is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         if image_source not in ["gallery", "camera"]:
-            return Response({"error": "image_source must be 'gallery' or 'camera'"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "image_source must be 'gallery' or 'camera'"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             chat = GroupChat.objects.get(id=chat_id)
         except GroupChat.DoesNotExist:
-            return Response({"error": "Chat not found"}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"error": "Chat not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
         try:
             sender = User.objects.get(email=sender_email)
         except User.DoesNotExist:
-            return Response({"error": "Sender not found"}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"error": "Sender not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
-        GroupChatMessage.objects.create(
-            chat=chat,
-            sender=sender,
-            sender_name=_display_name(sender),
-            is_current_user=(sender.id == chat.created_for.id),
-            message_type="IMAGE",
-            content=caption,
-            image=image,
-            image_source=image_source,
+        uploaded_count = 0
+
+        for img in images:
+            GroupChatMessage.objects.create(
+                chat=chat,
+                sender=sender,
+                sender_name=_display_name(sender),
+                is_current_user=(sender.id == chat.created_for.id),
+                message_type="IMAGE",
+                content=caption,
+                image=img,
+                image_source=image_source,
+            )
+            uploaded_count += 1
+
+        return Response(
+            {
+                "success": True,
+                "message": f"{uploaded_count} image(s) shared successfully",
+                "data": _build_group_chat_payload(chat, request)
+            },
+            status=status.HTTP_200_OK
         )
-
-        return Response({
-            "success": True,
-            "message": "Image shared successfully",
-            "data": _build_group_chat_payload(chat, request)
-        }, status=status.HTTP_200_OK)
 
 
 class GroupChatEmojiListView(APIView):
@@ -1488,7 +1531,10 @@ class DirectChatCreateOrGetView(APIView):
         other_user_email = request.data.get("other_user_email")
 
         if not user_email or not other_user_email:
-            return Response({"error": "user_email and other_user_email are required"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "user_email and other_user_email are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             user = User.objects.get(email=user_email)
@@ -1552,7 +1598,10 @@ class DirectChatSendMessageView(APIView):
         message = request.data.get("message")
 
         if not chat_id or not sender_email or message is None:
-            return Response({"error": "chat_id, sender_email and message are required"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "chat_id, sender_email and message are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             chat = DirectChat.objects.get(id=chat_id)
@@ -1575,7 +1624,14 @@ class DirectChatSendMessageView(APIView):
             is_read=False,
         )
 
-        return Response({"success": True, "message": "Direct message sent successfully"}, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "success": True,
+                "message": "Direct message sent successfully",
+                "data": _build_direct_chat_payload(chat, sender, request),
+            },
+            status=status.HTTP_200_OK
+        )
 
 
 class MessagesInboxView(APIView):
@@ -1591,7 +1647,10 @@ class MessagesInboxView(APIView):
 
         inbox_items = []
 
-        group_chats = GroupChat.objects.filter(Q(created_for=current_user) | Q(members__user=current_user)).distinct()
+        group_chats = GroupChat.objects.filter(
+            Q(created_for=current_user) | Q(members__user=current_user)
+        ).distinct()
+
         for chat in group_chats:
             last_message = GroupChatMessage.objects.filter(chat=chat).order_by("-created_at").first()
             if not last_message:
@@ -1601,7 +1660,9 @@ class MessagesInboxView(APIView):
                 continue
 
             member = GroupChatMember.objects.filter(chat=chat).first()
-            avatar = request.build_absolute_uri(member.photo.url) if member and member.photo else None
+            avatar = None
+            if member and member.photo:
+                avatar = request.build_absolute_uri(member.photo.url) if request else member.photo.url
 
             unread_count = GroupChatMessage.objects.filter(chat=chat).exclude(sender=current_user).count()
 
@@ -1616,18 +1677,26 @@ class MessagesInboxView(APIView):
             })
 
         direct_chats = DirectChat.objects.filter(Q(user1=current_user) | Q(user2=current_user)).distinct()
+
         for chat in direct_chats:
             other_user = chat.user2 if chat.user1_id == current_user.id else chat.user1
             other_profile = _get_user_profile(other_user)
             last_message = DirectChatMessage.objects.filter(chat=chat).order_by("-created_at").first()
+
             if not last_message:
                 continue
 
-            other_name = other_profile.full_name if other_profile and other_profile.full_name else _display_name(other_user)
+            other_name = other_profile.full_name if other_profile and other_profile.full_name else other_user.email
             search_target = f"{other_name} {other_user.email} {last_message.content or ''}".lower()
 
             if search and search not in search_target:
                 continue
+
+            other_avatar = None
+            if other_profile and getattr(other_profile, "profile_photo", None):
+                other_avatar = request.build_absolute_uri(other_profile.profile_photo.url) if request else other_profile.profile_photo.url
+            elif other_profile and getattr(other_profile, "photo", None):
+                other_avatar = request.build_absolute_uri(other_profile.photo.url) if request else other_profile.photo.url
 
             unread_count = DirectChatMessage.objects.filter(chat=chat, is_read=False).exclude(sender=current_user).count()
 
@@ -1636,7 +1705,7 @@ class MessagesInboxView(APIView):
                 "conversation_id": chat.id,
                 "title": other_name,
                 "subtitle": last_message.content,
-                "avatar": request.build_absolute_uri(other_profile.photo.url) if other_profile and other_profile.photo else None,
+                "avatar": other_avatar,
                 "time": last_message.created_at,
                 "unread_count": unread_count,
                 "user_email": other_user.email,
@@ -1644,25 +1713,12 @@ class MessagesInboxView(APIView):
 
         inbox_items.sort(key=lambda x: x["time"], reverse=True)
 
-        formatted = []
-        for item in inbox_items:
-            formatted.append({
-                "conversation_type": item["conversation_type"],
-                "conversation_id": item["conversation_id"],
-                "title": item["title"],
-                "subtitle": item["subtitle"],
-                "avatar": item["avatar"],
-                "time": item["time"],
-                "unread_count": item["unread_count"],
-                "user_email": item.get("user_email"),
-            })
-
         return Response(
             {
                 "success": True,
-                "count": len(formatted),
+                "count": len(inbox_items),
                 "search": search,
-                "messages": formatted,
+                "messages": inbox_items,
             },
             status=status.HTTP_200_OK,
         )
@@ -1677,7 +1733,10 @@ class ProfileDashboardView(APIView):
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        profile, _ = UserProfile.objects.get_or_create(user=user)
+        profile, _ = UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"full_name": user.email}
+        )
         settings_obj = get_or_create_account_settings(user)
         listed_room = ListedRoom.objects.filter(user=user, is_active=True).first()
 
@@ -1686,12 +1745,6 @@ class ProfileDashboardView(APIView):
                 "success": True,
                 "data": {
                     "email": user.email,
-                    "first_name": getattr(user, "first_name", ""),
-                    "middle_name": getattr(user, "middle_name", ""),
-                    "last_name": getattr(user, "last_name", ""),
-                    "age": getattr(user, "age", None),
-                    "address": getattr(user, "address", ""),
-                    "phone_number": getattr(user, "phone_number", ""),
                     "profile": UserProfileDataSerializer(profile, context={"request": request}).data,
                     "account_settings": UserAccountSettingsSerializer(settings_obj).data,
                     "listed_room": ListedRoomSerializer(listed_room, context={"request": request}).data if listed_room else None,
@@ -1715,11 +1768,16 @@ class ProfileUpdateView(APIView):
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        profile, _ = UserProfile.objects.get_or_create(user=user)
+        profile, _ = UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"full_name": user.email}
+        )
 
         data = {
             "full_name": request.data.get("full_name"),
+            "gender": request.data.get("gender"),
             "age": request.data.get("age"),
+            "address": request.data.get("address"),
             "room_status": request.data.get("room_status"),
             "about_me": request.data.get("about_me"),
             "occupation": request.data.get("occupation"),
@@ -1731,9 +1789,12 @@ class ProfileUpdateView(APIView):
         if "photo" in request.FILES:
             data["photo"] = request.FILES["photo"]
 
+        if "profile_photo" in request.FILES:
+            data["profile_photo"] = request.FILES["profile_photo"]
+
         serializer = UserProfileCreateUpdateSerializer(profile, data=data, partial=True)
         if serializer.is_valid():
-            serializer.save()
+            profile = serializer.save()
             create_notification(user, "Profile Updated", "Your profile information was updated successfully.", "PROFILE")
             return Response(
                 {
@@ -1770,8 +1831,12 @@ class ProfilePhotoUploadView(APIView):
         except User.DoesNotExist:
             return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        profile, _ = UserProfile.objects.get_or_create(user=user)
+        profile, _ = UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"full_name": user.email}
+        )
         profile.photo = photo
+        profile.profile_photo = photo
         profile.save()
 
         create_notification(
@@ -1995,17 +2060,51 @@ class ListedRoomCreateUpdateView(APIView):
 
     @transaction.atomic
     def post(self, request):
+        print("REQUEST DATA:", request.data)
+        print("REQUEST FILES:", request.FILES)
+
         email = request.data.get("email")
         apartment_title = request.data.get("apartment_title")
+        address = request.data.get("address")
+        city = request.data.get("city")
         monthly_rent = request.data.get("monthly_rent")
         description = request.data.get("description")
+        room_status_value = request.data.get("status", "AVAILABLE")
+        bathroom_type = request.data.get("bathroom_type", "PRIVATE_BATH")
+        roommate_count = request.data.get("roommate_count", 1)
+        entry_type = request.data.get("entry_type", "KEYLESS")
+
+        email = email.strip() if isinstance(email, str) else email
+        apartment_title = apartment_title.strip() if isinstance(apartment_title, str) else apartment_title
+        address = address.strip() if isinstance(address, str) else address
+        city = city.strip() if isinstance(city, str) else city
+        monthly_rent = monthly_rent.strip() if isinstance(monthly_rent, str) else monthly_rent
+        description = description.strip() if isinstance(description, str) else description
+        room_status_value = room_status_value.strip() if isinstance(room_status_value, str) else room_status_value
+        bathroom_type = bathroom_type.strip() if isinstance(bathroom_type, str) else bathroom_type
+        entry_type = entry_type.strip() if isinstance(entry_type, str) else entry_type
 
         if not email:
             return Response({"error": "Email is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not apartment_title or not monthly_rent or not description:
+        missing_fields = []
+        if not apartment_title:
+            missing_fields.append("apartment_title")
+        if not address:
+            missing_fields.append("address")
+        if not city:
+            missing_fields.append("city")
+        if not monthly_rent:
+            missing_fields.append("monthly_rent")
+        if not description:
+            missing_fields.append("description")
+
+        if missing_fields:
             return Response(
-                {"error": "apartment_title, monthly_rent and description are required"},
+                {
+                    "error": f"{', '.join(missing_fields)} are required",
+                    "received_data": dict(request.data)
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -2018,25 +2117,36 @@ class ListedRoomCreateUpdateView(APIView):
 
         if room:
             room.apartment_title = apartment_title
+            room.address = address
+            room.city = city
             room.monthly_rent = monthly_rent
             room.description = description
+            room.status = room_status_value
+            room.bathroom_type = bathroom_type
+            room.roommate_count = roommate_count
+            room.entry_type = entry_type
             room.save()
             message_text = "Room listing updated successfully."
         else:
             room = ListedRoom.objects.create(
                 user=user,
                 apartment_title=apartment_title,
+                address=address,
+                city=city,
                 monthly_rent=monthly_rent,
                 description=description,
+                status=room_status_value,
+                bathroom_type=bathroom_type,
+                roommate_count=roommate_count,
+                entry_type=entry_type,
             )
             message_text = "Room listed successfully."
 
-        if request.FILES:
-            files = request.FILES.getlist("photos")
-            if files:
-                room.photos.all().delete()
-                for file_obj in files:
-                    ListedRoomPhoto.objects.create(room=room, image=file_obj)
+        files = request.FILES.getlist("photos")
+        if files:
+            room.photos.all().delete()
+            for file_obj in files:
+                ListedRoomPhoto.objects.create(room=room, image=file_obj)
 
         create_notification(user, "Room Listing Updated", message_text, "ROOM")
 
@@ -2070,6 +2180,108 @@ class ListedRoomDetailView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class HomeRoomsListView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, email):
+        search = request.GET.get("search", "").strip().lower()
+
+        try:
+            current_user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        current_budget = UserBudgetLocation.objects.filter(user=current_user).first()
+        preferred_city = current_budget.preferred_city.strip().lower() if current_budget and current_budget.preferred_city else None
+
+        rooms = ListedRoom.objects.filter(is_active=True).order_by("-created_at")
+
+        filtered_rooms = []
+        for room in rooms:
+            if search:
+                search_text = f"{room.apartment_title} {room.address or ''} {room.city or ''}".lower()
+                if search not in search_text:
+                    continue
+            elif preferred_city:
+                if room.city and room.city.strip().lower() != preferred_city:
+                    continue
+
+            filtered_rooms.append(room)
+
+        if not filtered_rooms:
+            filtered_rooms = list(ListedRoom.objects.filter(is_active=True).order_by("-created_at"))
+
+        serializer = HomeRoomListSerializer(
+            filtered_rooms,
+            many=True,
+            context={"request": request, "current_user": current_user}
+        )
+
+        return Response({
+            "success": True,
+            "count": len(serializer.data),
+            "rooms": serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class HomeRoomDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, room_id, email):
+        try:
+            current_user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            room = ListedRoom.objects.get(id=room_id, is_active=True)
+        except ListedRoom.DoesNotExist:
+            return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = HomeRoomDetailSerializer(
+            room,
+            context={"request": request, "current_user": current_user}
+        )
+
+        return Response({
+            "success": True,
+            "data": serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class RequestRoomShareView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        room_id = request.data.get("room_id")
+        user_email = request.data.get("user_email")
+
+        if not room_id or not user_email:
+            return Response({"error": "room_id and user_email are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(email=user_email)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            room = ListedRoom.objects.get(id=room_id, is_active=True)
+        except ListedRoom.DoesNotExist:
+            return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        create_notification(
+            user,
+            "Room Share Requested",
+            f"You requested to share {room.apartment_title}.",
+            "ROOM"
+        )
+
+        return Response({
+            "success": True,
+            "message": "Request to share sent successfully."
+        }, status=status.HTTP_200_OK)
 
 
 class LogoutView(APIView):
@@ -2249,8 +2461,8 @@ class DiscoverRoommatesView(APIView):
             if not profile or not lifestyle or not budget:
                 continue
 
-            full_name = profile.full_name if profile and profile.full_name else _display_name(user)
-            city = budget.preferred_city if budget and budget.preferred_city else getattr(user, "address", "")
+            full_name = profile.full_name if profile and profile.full_name else ""
+            city = budget.preferred_city if budget and budget.preferred_city else ""
             search_text = f"{full_name} {city} {user.email}".lower()
 
             if search and search not in search_text:
@@ -2320,7 +2532,7 @@ class AICompatibilityView(APIView):
             return Response({"error": "Target user not found"}, status=status.HTTP_404_NOT_FOUND)
 
         profile = UserProfile.objects.filter(user=target_user).first()
-        target_name = profile.full_name if profile and profile.full_name else _display_name(target_user)
+        target_name = profile.full_name if profile and profile.full_name else target_user.email
 
         result = calculate_detailed_compatibility(current_user, target_user)
 
@@ -2359,3 +2571,424 @@ class AICompatibilityView(APIView):
                 }
             }
         }, status=status.HTTP_200_OK)
+
+
+class RoomShareRequestFormView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, room_id, email):
+        try:
+            User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            room = ListedRoom.objects.get(id=room_id, is_active=True)
+        except ListedRoom.DoesNotExist:
+            return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        owner = room.user
+        owner_profile = UserProfile.objects.filter(user=owner).first()
+
+        quote_text = "I'm looking for someone who values a quiet home environment..."
+        if owner_profile and owner_profile.about_me:
+            quote_text = owner_profile.about_me[:90] + "..." if len(owner_profile.about_me) > 90 else owner_profile.about_me
+
+        owner_photo = None
+        if owner_profile and owner_profile.photo:
+            owner_photo = request.build_absolute_uri(owner_profile.photo.url) if request else owner_profile.photo.url
+        elif owner_profile and owner_profile.profile_photo:
+            owner_photo = request.build_absolute_uri(owner_profile.profile_photo.url) if request else owner_profile.profile_photo.url
+
+        return Response({
+            "success": True,
+            "data": {
+                "room_id": room.id,
+                "room_title": room.apartment_title,
+                "owner_email": owner.email,
+                "owner_name": owner_profile.full_name if owner_profile and owner_profile.full_name else owner.email,
+                "owner_photo": owner_photo,
+                "intro_quote": quote_text,
+                "duration_options": [
+                    "3 Months",
+                    "6 Months",
+                    "9 Months",
+                    "12 Months",
+                    "18 Months",
+                    "24+ Months"
+                ],
+                "employment_options": [
+                    "Full-time",
+                    "Part-time",
+                    "Student",
+                    "Freelance",
+                    "Unemployed"
+                ]
+            }
+        }, status=status.HTTP_200_OK)
+
+
+class SubmitRoomShareRequestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        room_id = request.data.get("room_id")
+        user_email = request.data.get("user_email")
+        intro_message = request.data.get("intro_message")
+        preferred_move_in_date = request.data.get("preferred_move_in_date")
+        duration_of_stay = request.data.get("duration_of_stay")
+        employment_status = request.data.get("employment_status")
+
+        if not room_id or not user_email:
+            return Response(
+                {"error": "room_id and user_email are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not intro_message:
+            return Response(
+                {"error": "intro_message is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if not preferred_move_in_date or not duration_of_stay or not employment_status:
+            return Response(
+                {"error": "preferred_move_in_date, duration_of_stay and employment_status are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            requester = User.objects.get(email=user_email)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            room = ListedRoom.objects.get(id=room_id, is_active=True)
+        except ListedRoom.DoesNotExist:
+            return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if room.user == requester:
+            return Response({"error": "You cannot request your own room"}, status=status.HTTP_400_BAD_REQUEST)
+
+        room_request, created = RoomShareRequest.objects.get_or_create(
+            room=room,
+            requester=requester,
+            defaults={
+                "room_owner": room.user,
+                "intro_message": intro_message,
+                "preferred_move_in_date": preferred_move_in_date,
+                "duration_of_stay": duration_of_stay,
+                "employment_status": employment_status,
+                "status": "PENDING",
+            }
+        )
+
+        if not created:
+            room_request.intro_message = intro_message
+            room_request.preferred_move_in_date = preferred_move_in_date
+            room_request.duration_of_stay = duration_of_stay
+            room_request.employment_status = employment_status
+            room_request.save()
+
+        create_notification(
+            requester,
+            "Room Share Request Sent",
+            f"Your request for {room.apartment_title} has been submitted.",
+            "ROOM"
+        )
+
+        create_notification(
+            room.user,
+            "New Room Share Request",
+            f"{requester.email} sent a request for {room.apartment_title}.",
+            "ROOM"
+        )
+
+        return Response({
+            "success": True,
+            "message": "Room share request submitted successfully.",
+            "data": {
+                "request_id": room_request.id,
+                "room_id": room.id,
+                "room_title": room.apartment_title,
+                "intro_message": room_request.intro_message,
+                "preferred_move_in_date": str(room_request.preferred_move_in_date),
+                "duration_of_stay": room_request.duration_of_stay,
+                "employment_status": room_request.employment_status,
+                "status": room_request.status
+            }
+        }, status=status.HTTP_201_CREATED)
+
+
+class RoomShareRequestDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, request_id):
+        try:
+            room_request = RoomShareRequest.objects.get(id=request_id)
+        except RoomShareRequest.DoesNotExist:
+            return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        room = room_request.room
+        requester = room_request.requester
+        owner = room_request.room_owner
+
+        requester_profile = UserProfile.objects.filter(user=requester).first()
+        owner_profile = UserProfile.objects.filter(user=owner).first()
+
+        owner_photo = None
+        if owner_profile and getattr(owner_profile, "profile_photo", None):
+            owner_photo = request.build_absolute_uri(owner_profile.profile_photo.url)
+        elif owner_profile and getattr(owner_profile, "photo", None):
+            owner_photo = request.build_absolute_uri(owner_profile.photo.url)
+
+        identity_document_url = None
+        if room_request.identity_document:
+            identity_document_url = request.build_absolute_uri(room_request.identity_document.url)
+
+        return Response({
+            "success": True,
+            "data": {
+                "request_id": room_request.id,
+                "room_id": room.id,
+                "room_title": room.apartment_title,
+                "room_city": room.city,
+                "room_address": room.address,
+                "room_monthly_rent": str(room.monthly_rent),
+                "requester_email": requester.email,
+                "requester_name": requester_profile.full_name if requester_profile and requester_profile.full_name else requester.email,
+                "owner_email": owner.email,
+                "owner_name": owner_profile.full_name if owner_profile and owner_profile.full_name else owner.email,
+                "owner_photo": owner_photo,
+                "intro_message": room_request.intro_message,
+                "preferred_move_in_date": str(room_request.preferred_move_in_date) if room_request.preferred_move_in_date else None,
+                "duration_of_stay": room_request.duration_of_stay,
+                "employment_status": room_request.employment_status,
+                "ai_background_check_completed": room_request.ai_background_check_completed,
+                "identity_document_url": identity_document_url,
+                "identity_upload_source": room_request.identity_upload_source,
+                "identity_verified": room_request.identity_verified,
+                "your_share_monthly": str(room_request.your_share_monthly) if room_request.your_share_monthly is not None else None,
+                "group_security_deposit": str(room_request.group_security_deposit) if room_request.group_security_deposit is not None else None,
+                "total_move_in": str(room_request.total_move_in) if room_request.total_move_in is not None else None,
+                "status": room_request.status,
+                "created_at": room_request.created_at,
+            }
+        }, status=status.HTTP_200_OK)
+
+class RoomShareVerificationView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, request_id):
+        try:
+            room_request = RoomShareRequest.objects.get(id=request_id)
+        except RoomShareRequest.DoesNotExist:
+            return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = RoomShareVerificationSerializer(room_request, context={"request": request})
+
+        return Response({
+            "success": True,
+            "data": {
+                **serializer.data,
+                "title": "Identity Verification",
+                "subtitle": "Please scan or upload a government-issued ID (Aadhar, PAN, Passport) to continue.",
+                "camera_enabled": True,
+                "gallery_enabled": True,
+                "verify_button_text": "Verify Identity"
+            }
+        }, status=status.HTTP_200_OK)
+
+
+class UploadIdentityDocumentView(APIView):
+    permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        request_id = request.data.get("request_id")
+        source = request.data.get("source")
+        identity_document = request.FILES.get("identity_document")
+
+        if not request_id:
+            return Response({"error": "request_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not identity_document:
+            return Response({"error": "identity_document is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if source not in ["camera", "gallery"]:
+            return Response({"error": "source must be camera or gallery"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            room_request = RoomShareRequest.objects.get(id=request_id)
+        except RoomShareRequest.DoesNotExist:
+            return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        room_request.identity_document = identity_document
+        room_request.identity_upload_source = source
+        room_request.identity_verified = True
+        room_request.save()
+
+        create_notification(
+            room_request.requester,
+            "Identity Uploaded",
+            "Your identity document has been uploaded successfully.",
+            "ACCOUNT"
+        )
+
+        serializer = RoomShareVerificationSerializer(room_request, context={"request": request})
+
+        return Response({
+            "success": True,
+            "message": "Identity document uploaded successfully.",
+            "data": serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class RoomShareFinalReviewView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, request_id):
+        try:
+            room_request = RoomShareRequest.objects.get(id=request_id)
+        except RoomShareRequest.DoesNotExist:
+            return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        monthly_share, deposit, total = _calculate_room_share_amounts(room_request.room)
+
+        room_request.your_share_monthly = monthly_share
+        room_request.group_security_deposit = deposit
+        room_request.total_move_in = total
+        room_request.save()
+
+        serializer = RoomShareFinalReviewSerializer(room_request, context={"request": request})
+
+        return Response({
+            "success": True,
+            "data": {
+                **serializer.data,
+                "title": "Final Review",
+                "subtitle": "Review your request to join the group.",
+                "button_text": "Send Request to Group"
+            }
+        }, status=status.HTTP_200_OK)
+
+
+class SendRoomShareRequestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        request_id = request.data.get("request_id")
+
+        if not request_id:
+            return Response({"error": "request_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            room_request = RoomShareRequest.objects.get(id=request_id)
+        except RoomShareRequest.DoesNotExist:
+            return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not room_request.identity_verified:
+            return Response({"error": "Complete identity verification first"}, status=status.HTTP_400_BAD_REQUEST)
+
+        room_request.status = "SENT"
+        room_request.save()
+
+        create_notification(
+            room_request.requester,
+            "Request Sent",
+            f"Your booking request for {room_request.room.apartment_title} has been sent.",
+            "ROOM"
+        )
+
+        create_notification(
+            room_request.room_owner,
+            "New Booking Request",
+            f"{room_request.requester.email} sent a booking request for {room_request.room.apartment_title}.",
+            "ROOM"
+        )
+
+        return Response({
+            "success": True,
+            "message": "Request sent successfully.",
+            "data": {
+                "request_id": room_request.id,
+                "title": "Request Sent!",
+                "subtitle": f"Your booking request for {room_request.room.apartment_title} has been sent to the owner. We'll notify you once they respond.",
+                "back_button_text": "Back to Home",
+                "message_owner_button_text": "Message Owner",
+                "owner_email": room_request.room_owner.email,
+                "room_title": room_request.room.apartment_title,
+                "status": room_request.status
+            }
+        }, status=status.HTTP_200_OK)
+
+
+class RoomShareRequestSentView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, request_id):
+        try:
+            room_request = RoomShareRequest.objects.get(id=request_id)
+        except RoomShareRequest.DoesNotExist:
+            return Response({"error": "Request not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = RoomShareRequestSentSerializer(room_request)
+
+        return Response({
+            "success": True,
+            "data": {
+                **serializer.data,
+                "title": "Request Sent!",
+                "subtitle": f"Your booking request for {room_request.room.apartment_title} has been sent to the owner. We'll notify you once they respond.",
+                "back_button_text": "Back to Home",
+                "message_owner_button_text": "Message Owner",
+                "owner_email": room_request.room_owner.email
+            }
+        }, status=status.HTTP_200_OK)
+
+
+class ProfileView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, email):
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = UserProfileSerializer(user, context={"request": request})
+
+        return Response({
+            "success": True,
+            "data": serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class NotificationList(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, email):
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        notifications = Notification.objects.filter(user=user).order_by("-created_at")
+        serializer = NotificationSerializer(notifications, many=True)
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class BookingHistoryView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, email):
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        bookings = BookingHistory.objects.filter(user=user)
+        serializer = BookingHistorySerializer(bookings, many=True)
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
